@@ -13,12 +13,11 @@ from rich.panel import Panel
 
 console = Console()
 
-TIMEOUT = 1.8
-
-MAX_CONCURRENT_PHASE1 = 300
-MAX_CONCURRENT_PHASE2 = 200
-MAX_CONCURRENT_PHASE3 = 100
-TEST_RETRIES_PHASE3 = 4
+TIMEOUT = 3.5
+MAX_CONCURRENT_PHASE1 = 250
+MAX_CONCURRENT_PHASE2 = 180
+MAX_CONCURRENT_PHASE3 = 60
+TEST_RETRIES_PHASE3 = 5
 LARGE_QUERY_SIZE = 200
 MAX_ACCEPTABLE_LOSS = 0
 MAX_AVG_RTT_MS = 350
@@ -50,7 +49,7 @@ async def quick_small_test(ip, port, domain):
     try:
         await loop.run_in_executor(None, lambda: dns.query.udp(q, ip, port=port, timeout=TIMEOUT))
         return True
-    except:
+    except Exception:
         return False
 
 async def large_query_test(ip, port, domain):
@@ -59,7 +58,7 @@ async def large_query_test(ip, port, domain):
     try:
         await loop.run_in_executor(None, lambda: dns.query.udp(q, ip, port=port, timeout=TIMEOUT))
         return True
-    except:
+    except Exception:
         return False
 
 async def stability_test(ip, port, domain):
@@ -68,21 +67,20 @@ async def stability_test(ip, port, domain):
     small_q = build_small_query(domain)
     large_q = build_large_query(domain)
     loop = asyncio.get_running_loop()
-
-    for _ in range(TEST_RETRIES_PHASE3):
+    for i in range(TEST_RETRIES_PHASE3):
         start = time.time()
         try:
             await loop.run_in_executor(None, lambda: dns.query.udp(small_q, ip, port=port, timeout=TIMEOUT))
             await loop.run_in_executor(None, lambda: dns.query.udp(large_q, ip, port=port, timeout=TIMEOUT))
             successes += 1
             rtts.append((time.time() - start) * 1000)
-        except:
+        except Exception:
             pass
-
+        if i < TEST_RETRIES_PHASE3 - 1:
+            await asyncio.sleep(0.5)
     loss = ((TEST_RETRIES_PHASE3 - successes) / TEST_RETRIES_PHASE3) * 100
     if successes == 0:
         return False, 0.0, loss
-
     avg_rtt = sum(rtts) / len(rtts)
     is_valid = (loss <= MAX_ACCEPTABLE_LOSS) and (avg_rtt <= MAX_AVG_RTT_MS)
     return is_valid, avg_rtt, loss
@@ -99,90 +97,74 @@ async def run_phase(title, targets, test_func, concurrent_limit, domain):
     semaphore = asyncio.Semaphore(concurrent_limit)
     start_time = time.time()
     stats = {"done": 0, "passed": 0}
-
+    survivors = []
     async def worker(ip, port):
         async with semaphore:
             result = await test_func(ip, port, domain)
             return (ip, port), result
-
     tasks = [asyncio.create_task(worker(ip, port)) for ip, port in targets]
-
     with Live(console=console, refresh_per_second=4) as live:
         for future in asyncio.as_completed(tasks):
             (ip, port), result = await future
             stats["done"] += 1
             if result:
                 stats["passed"] += 1
-
+                survivors.append((ip, port))
             elapsed = time.time() - start_time
             speed = stats["done"] / elapsed if elapsed > 0 else 0
-
             live.update(make_table(title, stats["done"], len(targets), stats["passed"], speed))
-
-    survivors = [t for i, t in enumerate(targets) if i < stats["passed"]]
     console.print(f"[green][✓][/green] {title} finished | Passed: {stats['passed']}")
     return survivors
 
 async def main():
     banner()
-
     input_file = console.input("[cyan]Enter IP list file:[/cyan] ").strip()
     output_file = console.input("[cyan]Enter output file:[/cyan] ").strip()
     domain = console.input("[cyan]Enter test domain:[/cyan] ").strip()
-
     try:
         with open(input_file, "r") as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    except:
+    except Exception:
         console.print("[red]File not found[/red]")
         return
-
     targets = []
     for line in lines:
         if ":" in line:
             try:
                 ip, port_str = line.rsplit(":", 1)
                 port = int(port_str)
-            except:
+            except Exception:
                 continue
         else:
             ip, port = line, 53
         targets.append((ip, port))
-
     console.print(f"\n[bold yellow]Loaded {len(targets)} IPs[/bold yellow]")
     console.print(f"[bold yellow]Domain:[/bold yellow] {domain}")
-
     with open(output_file, "w"):
         pass
-
     phase1 = await run_phase("Phase 1 - Quick Check", targets, quick_small_test, MAX_CONCURRENT_PHASE1, domain)
     phase2 = await run_phase("Phase 2 - Large Query", phase1, large_query_test, MAX_CONCURRENT_PHASE2, domain)
-
     console.print("\n[bold magenta]Phase 3 - Stability Test[/bold magenta]")
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_PHASE3)
     stats = {"done": 0, "valid": 0}
-
+    start_time = time.time()
     async def worker(ip, port):
         async with semaphore:
             return (ip, port), await stability_test(ip, port, domain)
-
     tasks = [asyncio.create_task(worker(ip, port)) for ip, port in phase2]
-
     with Live(console=console, refresh_per_second=4) as live:
         for future in asyncio.as_completed(tasks):
             (ip, port), (is_valid, avg_rtt, loss) = await future
             stats["done"] += 1
-
             if is_valid:
                 stats["valid"] += 1
                 addr = f"{ip}:{port}" if port != 53 else ip
                 with open(output_file, "a") as f:
                     f.write(addr + "\n")
                 console.print(f"[green]VALID[/green] {addr} | {avg_rtt:.1f}ms")
-
-            live.update(make_table("Phase 3", stats["done"], len(phase2), stats["valid"], stats["done"]))
-
+            elapsed = time.time() - start_time
+            speed = stats["done"] / elapsed if elapsed > 0 else 0
+            live.update(make_table("Phase 3", stats["done"], len(phase2), stats["valid"], speed))
     console.print(Panel.fit(
         f"[green]Finished[/green]\nValid IPs: {stats['valid']}\nSaved in: {output_file}",
         border_style="green"
